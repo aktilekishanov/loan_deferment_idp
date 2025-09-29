@@ -15,6 +15,7 @@ import streamlit as st
 # --- Конфигурация страницы ---
 st.set_page_config(page_title="S3 File Uploader", layout="centered")
 
+st.write("")
 st.title("RB Loan Deferment IDP")
 st.write("Загрузите один файл в Amazon S3 для последующей обработки.")
 
