@@ -4,48 +4,41 @@ import re
 import json
 import io
 import time
+import random
 
 import boto3
 from botocore.exceptions import BotoCoreError, NoCredentialsError, ClientError
 import streamlit as st
 
-
 # ======================= UI ЧАСТЬ =========================
-
-# --- Конфигурация страницы ---
 st.set_page_config(page_title="S3 File Uploader", layout="centered")
 
 st.write("")
 st.title("RB Loan Deferment IDP")
 st.write("Загрузите один файл в Amazon S3 для последующей обработки.")
 
-# --- Основные параметры (редактируются здесь) ---
+# --- Основные параметры ---
 AWS_PROFILE = ""   # профиль AWS из ~/.aws/credentials (оставьте пустым для env/role)
 AWS_REGION = "us-east-1"   # регион AWS
 BEDROCK_REGION = "us-east-1"  # регион Bedrock
 MODEL_ID = "anthropic.claude-3-5-sonnet-20240620-v1:0"  # используемая LLM модель
 BUCKET_NAME = "loan-deferment-idp-test-tlek"  # имя S3-бакета
-KEY_PREFIX = "uploads/"  # базовый префикс для загрузок (будет создана уникальная папка)
+KEY_PREFIX = "uploads/"  # базовый префикс для загрузок
 
+# --- Кастомизация интерфейса ---
+st.markdown("""
+<style>
+.block-container{max-width:980px;padding-top:1.25rem;}
+.meta{color:#6b7280;font-size:0.92rem;margin:0.25rem 0 1rem 0;}
+.meta code{background:#f3f4f6;border:1px solid #e5e7eb;padding:2px 6px;border-radius:6px;}
+.card{border:1px solid #e5e7eb;border-radius:14px;background:#ffffff;box-shadow:0 2px 8px rgba(0,0,0,.04);} 
+.card.pad{padding:22px;}
+.result-card{border:1px solid #e5e7eb;border-radius:14px;padding:16px;background:#fafafa;}
+.stButton>button{border-radius:10px;padding:.65rem 1rem;font-weight:600;}
+.stDownloadButton>button{border-radius:10px;}
+</style>
+""", unsafe_allow_html=True)
 
-# --- Лёгкая кастомизация интерфейса ---
-st.markdown(
-    """
-    <style>
-      .block-container{max-width:980px;padding-top:1.25rem;}
-      .meta{color:#6b7280;font-size:0.92rem;margin:0.25rem 0 1rem 0;}
-      .meta code{background:#f3f4f6;border:1px solid #e5e7eb;padding:2px 6px;border-radius:6px;}
-      .card{border:1px solid #e5e7eb;border-radius:14px;background:#ffffff;box-shadow:0 2px 8px rgba(0,0,0,.04);} 
-      .card.pad{padding:22px;}
-      .result-card{border:1px solid #e5e7eb;border-radius:14px;padding:16px;background:#fafafa;}
-      .stButton>button{border-radius:10px;padding:.65rem 1rem;font-weight:600;}
-      .stDownloadButton>button{border-radius:10px;}
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-# --- Блок справки ---
 with st.expander("Помощь и настройка", expanded=False):
     tabs = st.tabs(["Запуск приложения", "Создание Access Key", "Окружение"])
     with tabs[0]:
@@ -63,8 +56,7 @@ with st.expander("Помощь и настройка", expanded=False):
         st.markdown("### Окружение")
         st.markdown(f"- Bucket: `{BUCKET_NAME}`\n- Region: `{AWS_REGION}`\n- Model: `{MODEL_ID}`")
 
-
-# --- Форма загрузки файла ---
+# --- Форма загрузки ---
 with st.form("upload_form", clear_on_submit=False):
     uploaded_file = st.file_uploader(
         "Выберите документ",
@@ -83,7 +75,6 @@ def get_s3_client(profile, region_name):
         return session.client("s3")
     return boto3.client("s3", region_name=region_name or None)
 
-
 def get_next_upload_folder(s3_client, bucket, prefix):
     try:
         paginator = s3_client.get_paginator("list_objects_v2")
@@ -100,13 +91,11 @@ def get_next_upload_folder(s3_client, bucket, prefix):
         ts = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
         return f"{prefix}upload_id_{ts}/"
 
-
 def textract_blocks_to_text(tex_resp: dict) -> str:
     lines = [b.get("Text", "") for b in tex_resp.get("Blocks", []) if b.get("BlockType") == "LINE"]
     return "\n".join([ln for ln in lines if ln])
 
-
-# --- Обнаружение подписей (Textract SIGNATURES) ---
+# --- Обнаружение подписей (Textract SIGNATURES) с backoff ---
 def detect_signatures(textract_client, bucket: str, key: str, content_type: str):
     results = []
     try:
@@ -126,27 +115,48 @@ def detect_signatures(textract_client, bucket: str, key: str, content_type: str)
             )
             job_id = start["JobId"]
             pages = []
+
+            # Backoff функция
+            def get_document_analysis_with_backoff(job_id, max_retries=6):
+                retries = 0
+                while True:
+                    try:
+                        resp = textract_client.get_document_analysis(JobId=job_id, MaxResults=1000)
+                        return resp
+                    except ClientError as e:
+                        if e.response['Error']['Code'] == "ThrottlingException":
+                            wait = (2 ** retries) + random.random()
+                            time.sleep(wait)
+                            retries += 1
+                            if retries > max_retries:
+                                raise Exception("Превышено количество попыток из-за ThrottlingException")
+                        else:
+                            raise
+
             while True:
-                resp = textract_client.get_document_analysis(JobId=job_id, MaxResults=1000)
+                resp = get_document_analysis_with_backoff(job_id)
                 status = resp["JobStatus"]
-                if status == "IN_PROGRESS":
-                    time.sleep(2.0)
-                    continue
-                pages.append(resp)
-                next_token = resp.get("NextToken")
-                while next_token:
-                    nxt = textract_client.get_document_analysis(JobId=job_id, MaxResults=1000, NextToken=next_token)
-                    pages.append(nxt)
-                    next_token = nxt.get("NextToken")
-                break
+                if status == "SUCCEEDED":
+                    pages.append(resp)
+                    next_token = resp.get("NextToken")
+                    while next_token:
+                        nxt = get_document_analysis_with_backoff(job_id)
+                        pages.append(nxt)
+                        next_token = nxt.get("NextToken")
+                    break
+                elif status == "FAILED":
+                    raise Exception("Textract анализ не удался")
+                else:
+                    time.sleep(2 + random.random())
+
             for page in pages:
                 for b in page.get("Blocks", []) or []:
                     if b.get("BlockType") == "SIGNATURE":
                         results.append({"confidence": b.get("Confidence"), "geometry": b.get("Geometry"), "page": b.get("Page")})
+
     except Exception as e:
         return {"signatures": [], "error": str(e)}
     return {"signatures": results, "error": None}
-
 
 # --- Эвристическое обнаружение печатей (Rekognition) ---
 def detect_stamp_rekognition(bucket: str, key: str, content_type: str):
@@ -166,7 +176,6 @@ def detect_stamp_rekognition(bucket: str, key: str, content_type: str):
     except Exception as e:
         return {"stamps": [], "error": str(e)}
 
-
 def build_prompt_russian(extracted_text: str) -> str:
     instruction = (
         "Извлеки следующую информацию из текста.\n"
@@ -185,13 +194,11 @@ def build_prompt_russian(extracted_text: str) -> str:
     )
     return instruction + extracted_text
 
-
 def get_bedrock_client(profile: str | None, region_name: str | None):
     if profile:
         session = boto3.session.Session(profile_name=profile, region_name=region_name or None)
         return session.client("bedrock-runtime")
     return boto3.client("bedrock-runtime", region_name=region_name or None)
-
 
 def call_bedrock_invoke(model_id: str, prompt: str, client):
     if model_id.startswith("anthropic."):
@@ -222,9 +229,7 @@ def call_bedrock_invoke(model_id: str, prompt: str, client):
             return data["results"][0].get("outputText", "")
         return json.dumps(data)
 
-
 # =============== ОСНОВНОЙ ПРОЦЕСС =========================
-
 if submitted:
     if not BUCKET_NAME:
         st.error("S3-бакет не настроен.")
@@ -299,7 +304,6 @@ if submitted:
                     if parsed is None:
                         parsed = {"Ошибка": "LLM вернул невалидный JSON"}
 
-                    # Добавляем подписи и печати
                     parsed["_signatures"] = signature_hits
                     parsed["_stamps"] = stamp_hits
 
@@ -340,5 +344,3 @@ if submitted:
             st.error(f"AWS ClientError: {err.get('Code', 'Unknown')} - {err.get('Message', str(e))}")
         except (BotoCoreError, Exception) as e:
             st.error(f"Ошибка при загрузке: {e}")
-
-
