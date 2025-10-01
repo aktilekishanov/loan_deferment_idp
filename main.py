@@ -25,7 +25,7 @@ MODEL_ID = "anthropic.claude-3-5-sonnet-20240620-v1:0"  # используема
 BUCKET_NAME = "loan-deferment-idp-test-tlek"  # имя S3-бакета
 KEY_PREFIX = "uploads/"  # базовый префикс для загрузок
 
-# --- Кастомизация интерфейса ---
+# --- Кастомизация интерфейса ---\
 st.markdown("""
 <style>
 .block-container{max-width:980px;padding-top:1.25rem;}
@@ -321,15 +321,90 @@ if submitted:
                     status.update(label="Обработка завершена", state="complete")
                 progress.progress(100)
 
-                st.subheader("Результат")
-                st.json(parsed)
-                st.caption(f"Сохранено в s3://{BUCKET_NAME}/{json_key}")
-                st.download_button(
-                    label="Скачать JSON",
-                    data=json.dumps(parsed, ensure_ascii=False, indent=2).encode("utf-8"),
-                    file_name="extraction.json",
-                    mime="application/json",
-                )
+                # ===================== РЕЗУЛЬТАТ (улучшенный UI) =====================
+                st.markdown("### Результат")
+
+                # Быстрые метрики и статусы
+                signatures_info = parsed.get("_signatures") or {}
+                stamps_info = parsed.get("_stamps") or {}
+                signatures = signatures_info.get("signatures") or [] if isinstance(signatures_info, dict) else []
+                stamps = stamps_info.get("stamps") or [] if isinstance(stamps_info, dict) else []
+
+                col1, col2, col3 = st.columns([1, 1, 2])
+                with col1:
+                    st.metric(label="Подписи (Textract)", value=len(signatures))
+                with col2:
+                    st.metric(label="Печати/логотипы (Rekognition)", value=len(stamps))
+                with col3:
+                    st.caption(f"S3: s3://{BUCKET_NAME}/{json_key}")
+
+                # Сообщение об ошибках извлечения
+                llm_error = parsed.get("Ошибка")
+                sig_err = signatures_info.get("error") if isinstance(signatures_info, dict) else None
+                stamp_err = stamps_info.get("error") if isinstance(stamps_info, dict) else None
+                if llm_error:
+                    st.error(f"Ошибка парсинга LLM: {llm_error}")
+                if sig_err:
+                    st.warning(f"Ошибка при обнаружении подписей: {sig_err}")
+                if stamp_err:
+                    st.warning(f"Ошибка при обнаружении печатей: {stamp_err}")
+
+                # Табы: Структура | Диагностика | JSON
+                tab_structure, tab_diag, tab_json = st.tabs(["Структурированные поля", "Диагностика", "Сырые данные (JSON)"])
+
+                # --- Структурированные поля ---
+                with tab_structure:
+                    # Отфильтровать служебные ключи
+                    user_fields = {k: v for k, v in parsed.items() if not str(k).startswith("_") and k != "Ошибка"}
+                    if not user_fields:
+                        st.info("Нет извлечённых полей для отображения.")
+                    else:
+                        # Табличное представление: одна строка = одна пара (ключ, значение)
+                        items = list(user_fields.items())
+                        rows = [{"Поле": k, "Значение": (v if v not in (None, "") else "—")} for k, v in items]
+
+                        # Добавляем агрегат по подписям как отдельную запись
+                        try:
+                            if signatures:
+                                confidences = [s.get("confidence") for s in signatures if isinstance(s, dict) and s.get("confidence") is not None]
+                                if confidences:
+                                    max_conf = max(confidences)
+                                    # Textract возвращает [0..100]
+                                    cr_text = f"обнаружен (CR {round(max_conf)}%)"
+                                else:
+                                    cr_text = "обнаружен"
+                            else:
+                                cr_text = "не обнаружен"
+                        except Exception:
+                            cr_text = "не обнаружен"
+
+                        rows = ([{"Поле": "Подпись", "Значение": cr_text}] + rows)
+                        st.table(rows)
+
+                # --- Диагностика ---
+                with tab_diag:
+                    st.markdown("#### Обнаружение подписей")
+                    if signatures:
+                        st.json({"count": len(signatures), "items": signatures})
+                    else:
+                        st.caption("Подписи не обнаружены.")
+
+                    st.markdown("#### Обнаружение печатей / логотипов")
+                    if stamps:
+                        st.json({"count": len(stamps), "items": stamps})
+                    else:
+                        st.caption("Печати/логотипы не обнаружены или не применимо для PDF.")
+
+                # --- Сырые данные ---
+                with tab_json:
+                    st.json(parsed)
+                    st.download_button(
+                        label="Скачать JSON",
+                        data=json.dumps(parsed, ensure_ascii=False, indent=2).encode("utf-8"),
+                        file_name="extraction.json",
+                        mime="application/json",
+                        use_container_width=True,
+                    )
 
             except ClientError as e:
                 err = e.response.get("Error", {})
