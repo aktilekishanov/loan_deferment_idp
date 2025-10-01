@@ -11,10 +11,6 @@ venv/
 # OS files
 .DS_Store
 
-# Streamlit
-.streamlit/secrets.toml
-.streamlit/config.toml
-
 # Python packaging
 build/
 dist/
