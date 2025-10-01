@@ -5,6 +5,14 @@ import json
 import io
 import time
 import random
+import tempfile
+import base64
+import pandas as pd
+
+try:
+    import fitz  # PyMuPDF
+except Exception:
+    fitz = None
 
 import boto3
 from botocore.exceptions import BotoCoreError, NoCredentialsError, ClientError
@@ -14,16 +22,21 @@ import streamlit as st
 st.set_page_config(page_title="S3 File Uploader", layout="centered")
 
 st.write("")
-st.title("RB Loan Deferment IDP")
+st.title("RB Loan Deferment IDP sds")
 st.write("Загрузите один файл в Amazon S3 для последующей обработки.")
 
 # --- Основные параметры ---
 AWS_PROFILE = ""   # профиль AWS из ~/.aws/credentials (оставьте пустым для env/role)
 AWS_REGION = "us-east-1"   # регион AWS
 BEDROCK_REGION = "us-east-1"  # регион Bedrock
-MODEL_ID = "anthropic.claude-3-5-sonnet-20240620-v1:0"  # используемая LLM модель
+MODEL_ID = "anthropic.claude-3-7-sonnet-20250219-v1:0"  # используемая LLM модель с vision
 BUCKET_NAME = "loan-deferment-idp-test-tlek"  # имя S3-бакета
 KEY_PREFIX = "uploads/"  # базовый префикс для загрузок
+
+# Inference Profile for Claude 3.7 Sonnet (can be ID or ARN). ARN is recommended.
+DEFAULT_INFERENCE_PROFILE_ID = "us.anthropic.claude-3-7-sonnet-20250219-v1:0"
+DEFAULT_INFERENCE_PROFILE_ARN = "arn:aws:bedrock:us-east-1:183295407481:inference-profile/us.anthropic.claude-3-7-sonnet-20250219-v1:0"
+
 
 # --- Кастомизация интерфейса ---\
 st.markdown("""
@@ -55,6 +68,18 @@ with st.expander("Помощь и настройка", expanded=False):
     with tabs[2]:
         st.markdown("### Окружение")
         st.markdown(f"- Bucket: `{BUCKET_NAME}`\n- Region: `{AWS_REGION}`\n- Model: `{MODEL_ID}`")
+        # Настройка Inference Profile через UI / ENV
+        default_ip = (
+            os.getenv("BEDROCK_INFERENCE_PROFILE")
+            or DEFAULT_INFERENCE_PROFILE_ARN
+            or DEFAULT_INFERENCE_PROFILE_ID
+        )
+        ip_value = st.text_input(
+            "Inference Profile (ID или ARN для Claude 3.7 Sonnet)",
+            value=st.session_state.get("inference_profile", default_ip),
+            help="Например ID: us.anthropic.claude-3-7-sonnet-20250219-v1:0 или ARN: arn:aws:bedrock:...:inference-profile/us.anthropic.claude-3-7-sonnet-20250219-v1:0",
+        )
+        st.session_state["inference_profile"] = ip_value.strip() if ip_value else ""
 
 # --- Форма загрузки ---
 with st.form("upload_form", clear_on_submit=False):
@@ -158,23 +183,110 @@ def detect_signatures(textract_client, bucket: str, key: str, content_type: str)
         return {"signatures": [], "error": str(e)}
     return {"signatures": results, "error": None}
 
-# --- Эвристическое обнаружение печатей (Rekognition) ---
-def detect_stamp_rekognition(bucket: str, key: str, content_type: str):
+def _b64_image_from_bytes(img_bytes: bytes, media_type: str) -> dict:
+    return {
+        "type": "image",
+        "source": {
+            "type": "base64",
+            "media_type": media_type,
+            "data": base64.b64encode(img_bytes).decode("utf-8"),
+        },
+    }
+
+def detect_stamp_llm(bedrock_client, model_id: str, images: list[dict]):
+    """
+    images: список элементов content для Anthropic messages API вида
+      {"type":"image", "source": {"type":"base64","media_type":"image/png","data":"..."}}
+    Возвращает: {"present": bool|None, "confidence": float|None, "reason": str|None, "raw": str, "error": None|str}
+    """
     try:
-        is_pdf = ("pdf" in (content_type or "").lower()) or key.lower().endswith(".pdf")
-        if is_pdf:
-            return {"stamps": [], "error": None}
-        rek = boto3.client("rekognition")
-        resp = rek.detect_labels(Image={"S3Object": {"Bucket": bucket, "Name": key}}, MaxLabels=50, MinConfidence=70)
-        interesting = {"Stamp", "Seal", "Emblem", "Logo", "Badge", "Symbol", "Trademark"}
-        hits = []
-        for lbl in resp.get("Labels", []) or []:
-            if lbl.get("Name") in interesting:
-                insts = [{"confidence": i.get("Confidence"), "bounding_box": i.get("BoundingBox")} for i in (lbl.get("Instances", []) or [])]
-                hits.append({"name": lbl.get("Name"), "confidence": lbl.get("Confidence"), "instances": insts})
-        return {"stamps": hits, "error": None}
+        instruction = (
+            "Определи, есть ли на изображении отсканированного документа печать (штамп/круглая/прямоугольная).")
+        format_req = (
+            "Верни строго JSON без пояснений:\n"
+            "{\n  \"stamp_present\": true|false,\n  \"confidence\": number (0..100),\n  \"reason\": string\n}"
+        )
+        body = {
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": 256,
+            "temperature": 0,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": ([{"type": "text", "text": instruction + "\n" + format_req}] + images),
+                }
+            ],
+        }
+        data = _invoke_with_inference_profile(bedrock_client, body, model_id=model_id)
+        text = data.get("content", [{}])[0].get("text", "")
+        # Попытка распарсить JSON из ответа
+        parsed = None
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            s = text.find("{")
+            e = text.rfind("}")
+            if s != -1 and e != -1 and e > s:
+                try:
+                    parsed = json.loads(text[s:e+1])
+                except Exception:
+                    parsed = None
+        if not isinstance(parsed, dict):
+            return {"present": None, "confidence": None, "reason": None, "raw": text, "error": "LLM returned non-JSON"}
+        return {
+            "present": parsed.get("stamp_present"),
+            "confidence": parsed.get("confidence"),
+            "reason": parsed.get("reason"),
+            "raw": text,
+            "error": None,
+        }
     except Exception as e:
-        return {"stamps": [], "error": str(e)}
+        return {"present": None, "confidence": None, "reason": None, "raw": "", "error": str(e)}
+
+def convert_pdf_to_images_and_store(s3_client, bucket: str, key: str, max_pages: int = 3, zoom: float = 2.0):
+    """
+    Конвертация первых max_pages страниц PDF (из S3) в PNG изображения.
+    Сохраняет локально в /tmp и загружает в S3 по пути previews/page_XXX.png.
+
+    Возвращает dict: {"local_paths": [..], "s3_keys": [..], "error": None|str}
+    """
+    if fitz is None:
+        return {"local_paths": [], "s3_keys": [], "error": "PyMuPDF (fitz) не установлен"}
+    try:
+        obj = s3_client.get_object(Bucket=bucket, Key=key)
+        pdf_bytes = obj["Body"].read()
+
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        pages = min(len(doc), max_pages)
+        local_paths = []
+        s3_keys = []
+        tmp_dir = tempfile.mkdtemp(prefix="pdf_previews_")
+
+        # Префикс для S3 (тот же каталог, что и у исходного файла)
+        folder = key.rsplit("/", 1)[0] + "/" if "/" in key else ""
+        previews_prefix = f"{folder}previews/"
+
+        mat = fitz.Matrix(zoom, zoom)
+        for i in range(pages):
+            page = doc.load_page(i)
+            pix = page.get_pixmap(matrix=mat, colorspace=fitz.csRGB, alpha=False)
+            local_path = os.path.join(tmp_dir, f"page_{i+1:03d}.png")
+            pix.save(local_path)
+            local_paths.append(local_path)
+
+            preview_key = f"{previews_prefix}page_{i+1:03d}.png"
+            with open(local_path, "rb") as f:
+                s3_client.upload_fileobj(
+                    Fileobj=f,
+                    Bucket=bucket,
+                    Key=preview_key,
+                    ExtraArgs={"ContentType": "image/png"},
+                )
+            s3_keys.append(preview_key)
+
+        return {"local_paths": local_paths, "s3_keys": s3_keys, "error": None}
+    except Exception as e:
+        return {"local_paths": [], "s3_keys": [], "error": str(e)}
 
 def build_prompt_russian(extracted_text: str) -> str:
     instruction = (
@@ -200,6 +312,30 @@ def get_bedrock_client(profile: str | None, region_name: str | None):
         return session.client("bedrock-runtime")
     return boto3.client("bedrock-runtime", region_name=region_name or None)
 
+def _get_inference_profile_from_state() -> str | None:
+    # Порядок приоритета: UI state -> ENV -> defaults
+    ip = (
+        st.session_state.get("inference_profile")
+        or os.getenv("BEDROCK_INFERENCE_PROFILE")
+        or DEFAULT_INFERENCE_PROFILE_ARN
+        or DEFAULT_INFERENCE_PROFILE_ID
+    )
+    return ip
+
+def _invoke_with_inference_profile(client, body: dict, model_id: str):
+    payload = json.dumps(body)
+    ip = _get_inference_profile_from_state()
+    # В текущей версии SDK профиль передаётся в modelId (ID/ARN профиля),
+    # так как параметры inferenceProfileArn/Id не поддерживаются.
+    target_model_id = (ip.strip() if ip else model_id)
+    resp = client.invoke_model(
+        modelId=target_model_id,
+        contentType="application/json",
+        accept="application/json",
+        body=payload,
+    )
+    return json.loads(resp["body"].read())
+
 def call_bedrock_invoke(model_id: str, prompt: str, client):
     if model_id.startswith("anthropic."):
         body = {
@@ -208,23 +344,11 @@ def call_bedrock_invoke(model_id: str, prompt: str, client):
             "temperature": 0,
             "messages": [{"role": "user", "content": [{"type": "text", "text": prompt}]}],
         }
-        resp = client.invoke_model(
-            modelId=model_id,
-            contentType="application/json",
-            accept="application/json",
-            body=json.dumps(body),
-        )
-        data = json.loads(resp["body"].read())
+        data = _invoke_with_inference_profile(client, body, model_id=model_id)
         return data.get("content", [{}])[0].get("text", "")
     else:
         body = {"inputText": prompt, "textGenerationConfig": {"maxTokenCount": 1024, "temperature": 0}}
-        resp = client.invoke_model(
-            modelId=model_id,
-            contentType="application/json",
-            accept="application/json",
-            body=json.dumps(body),
-        )
-        data = json.loads(resp["body"].read())
+        data = _invoke_with_inference_profile(client, body, model_id=model_id)
         if "results" in data and data["results"]:
             return data["results"][0].get("outputText", "")
         return json.dumps(data)
@@ -276,12 +400,40 @@ if submitted:
                     else:
                         textract = boto3.client("textract", region_name=AWS_REGION)
 
+                    # Если загружен PDF, создадим превью изображений и сохраним локально и в S3
+                    is_pdf = ("pdf" in (content_type or "").lower()) or key.lower().endswith(".pdf")
+                    pdf_previews = None
+                    if is_pdf:
+                        status.update(label="Конвертация PDF в изображения...", state="running")
+                        pdf_previews = convert_pdf_to_images_and_store(s3, BUCKET_NAME, key, max_pages=3, zoom=2.0)
+                        st.session_state["pdf_previews"] = pdf_previews
+
                     tex_resp = textract.detect_document_text(Document={"S3Object": {"Bucket": BUCKET_NAME, "Name": key}})
                     progress.progress(60)
 
                     # Подписи и печати
                     signature_hits = detect_signatures(textract, BUCKET_NAME, key, content_type)
-                    stamp_hits = detect_stamp_rekognition(BUCKET_NAME, key, content_type)
+                    # LLM определение печати (изображения: превью страниц PDF или само изображение для JPEG)
+                    stamp_hits = {"present": None, "confidence": None, "reason": None, "raw": "", "error": None}
+                    try:
+                        bedrock = get_bedrock_client(AWS_PROFILE.strip() or None, BEDROCK_REGION)
+                        imgs_content = []
+                        if is_pdf and st.session_state.get("pdf_previews") and st.session_state["pdf_previews"].get("local_paths"):
+                            # Используем локальные PNG превью
+                            for lp in st.session_state["pdf_previews"]["local_paths"][:3]:
+                                with open(lp, "rb") as f:
+                                    imgs_content.append(_b64_image_from_bytes(f.read(), "image/png"))
+                        else:
+                            # Для JPEG: берём оригинальный объект из S3
+                            if ("jpeg" in content_type.lower()) or ("jpg" in content_type.lower()) or key.lower().endswith((".jpg",".jpeg")):
+                                obj = s3.get_object(Bucket=BUCKET_NAME, Key=key)
+                                bts = obj["Body"].read()
+                                imgs_content.append(_b64_image_from_bytes(bts, "image/jpeg"))
+                        if imgs_content:
+                            stamp_llm = detect_stamp_llm(bedrock, MODEL_ID, imgs_content)
+                            stamp_hits = stamp_llm
+                    except Exception as e:
+                        stamp_hits = {"present": None, "confidence": None, "reason": None, "raw": "", "error": str(e)}
 
                     status.update(label="Извлечение полей через Bedrock...", state="running")
                     extracted_text = textract_blocks_to_text(tex_resp)[:15000]
@@ -328,15 +480,7 @@ if submitted:
                 signatures_info = parsed.get("_signatures") or {}
                 stamps_info = parsed.get("_stamps") or {}
                 signatures = signatures_info.get("signatures") or [] if isinstance(signatures_info, dict) else []
-                stamps = stamps_info.get("stamps") or [] if isinstance(stamps_info, dict) else []
-
-                col1, col2, col3 = st.columns([1, 1, 2])
-                with col1:
-                    st.metric(label="Подписи (Textract)", value=len(signatures))
-                with col2:
-                    st.metric(label="Печати/логотипы (Rekognition)", value=len(stamps))
-                with col3:
-                    st.caption(f"S3: s3://{BUCKET_NAME}/{json_key}")
+                stamp_present = stamps_info.get("present") if isinstance(stamps_info, dict) else None
 
                 # Сообщение об ошибках извлечения
                 llm_error = parsed.get("Ошибка")
@@ -377,9 +521,32 @@ if submitted:
                                 cr_text = "не обнаружен"
                         except Exception:
                             cr_text = "не обнаружен"
+                        # Не добавляем сразу; перенесём в конец таблицы
 
-                        rows = ([{"Поле": "Подпись", "Значение": cr_text}] + rows)
-                        st.table(rows)
+                        # Добавляем агрегат по печати из LLM
+                        try:
+                            if isinstance(stamps_info, dict) and stamps_info.get("present") is True:
+                                conf = stamps_info.get("confidence")
+                                if isinstance(conf, (int, float)):
+                                    stamp_text = f"обнаружена (CR {round(conf)}%)"
+                                else:
+                                    stamp_text = "обнаружена"
+                            elif isinstance(stamps_info, dict) and stamps_info.get("present") is False:
+                                stamp_text = "не обнаружена"
+                            else:
+                                stamp_text = "не определено"
+                        except Exception:
+                            stamp_text = "не определено"
+                        # Перемещаем "Подпись" и "Печать" в конец списка
+                        rows.extend([
+                            {"Поле": "Подпись", "Значение": cr_text},
+                            {"Поле": "Печать", "Значение": stamp_text},
+                        ])
+
+                        # Используем индекс DataFrame, начиная с 1 (без отдельной колонки "№")
+                        df = pd.DataFrame(rows)
+                        df.index = range(1, len(df) + 1)
+                        st.table(df)
 
                 # --- Диагностика ---
                 with tab_diag:
@@ -389,11 +556,25 @@ if submitted:
                     else:
                         st.caption("Подписи не обнаружены.")
 
-                    st.markdown("#### Обнаружение печатей / логотипов")
-                    if stamps:
-                        st.json({"count": len(stamps), "items": stamps})
+                    st.markdown("#### Обнаружение печати (LLM)")
+                    if isinstance(stamps_info, dict):
+                        st.json(stamps_info)
                     else:
-                        st.caption("Печати/логотипы не обнаружены или не применимо для PDF.")
+                        st.caption("Результат определения печати отсутствует.")
+
+                    # Превью PDF страниц (если были сгенерированы)
+                    previews = st.session_state.get("pdf_previews") if "pdf_previews" in st.session_state else None
+                    if previews and not previews.get("error") and previews.get("local_paths"):
+                        st.markdown("#### Превью страниц (PDF → PNG)")
+                        # Показываем до 3 изображений
+                        for p in previews["local_paths"][:3]:
+                            st.image(p, caption=os.path.basename(p), use_container_width=True)
+                        if previews.get("s3_keys"):
+                            st.caption("S3 превью:")
+                            for k in previews["s3_keys"]:
+                                st.code(f"s3://{BUCKET_NAME}/{k}")
+                    elif previews and previews.get("error"):
+                        st.warning(f"Не удалось сгенерировать превью PDF: {previews['error']}")
 
                 # --- Сырые данные ---
                 with tab_json:
